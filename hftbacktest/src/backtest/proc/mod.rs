@@ -7,6 +7,7 @@ use std::collections::HashMap;
 pub use local::Local;
 pub use nopartialfillexchange::NoPartialFillExchange;
 pub use partialfillexchange::PartialFillExchange;
+pub mod fill_record;
 
 mod l3_local;
 
@@ -101,6 +102,21 @@ where
 }
 
 impl<P: Processor + ?Sized> Processor for Box<P> {
+    fn set_book_fill_mode(&mut self, mode: u8) -> bool {
+        P::set_book_fill_mode(self, mode)
+    }
+
+    fn set_fill_recording(&mut self, enabled: bool) -> bool {
+        P::set_fill_recording(self, enabled)
+    }
+
+    fn last_fills(&self) -> &[fill_record::FillRecord] {
+        P::last_fills(self)
+    }
+
+    fn clear_last_fills(&mut self) {
+        P::clear_last_fills(self)
+    }
     fn event_seen_timestamp(&self, event: &Event) -> Option<i64> {
         P::event_seen_timestamp(self, event)
     }
@@ -127,6 +143,19 @@ impl<P: Processor + ?Sized> Processor for Box<P> {
 }
 /// Processes the historical feed data and the order interaction.
 pub trait Processor {
+    /// Configures whether passive orders can fill solely because the replayed
+    /// book touches or crosses their price.  Unsupported processors accept
+    /// only the standard mode (0).
+    fn set_book_fill_mode(&mut self, mode: u8) -> bool { mode == 0 }
+
+    /// Enable optional fill-cause recording. Unsupported processors reject
+    /// enabling it; disabling remains a no-op for backward compatibility.
+    fn set_fill_recording(&mut self, enabled: bool) -> bool { !enabled }
+
+    fn last_fills(&self) -> &[fill_record::FillRecord] { &[] }
+
+    fn clear_last_fills(&mut self) {}
+
     /// The time of an event as seen by this [Processor]. For a local event processor this will
     /// be the timestamp an event was seen at locally, and for an exchange processor this will
     /// be the timestamp an event was generated at on the exchange.

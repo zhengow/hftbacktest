@@ -682,6 +682,20 @@ where
         }
     }
 
+    /// Exchange-side diagnostic fills since the last clear. The view is invalidated
+    /// by advancing or clearing the backtest. Never use this as a live observation.
+    pub fn last_fills(&self, asset_no: usize) -> &[proc::fill_record::FillRecord] {
+        self.exch[asset_no].last_fills()
+    }
+
+    pub fn clear_last_fills(&mut self, asset_no: usize) {
+        if asset_no == usize::MAX {
+            for exch in &mut self.exch { exch.clear_last_fills(); }
+        } else {
+            self.exch[asset_no].clear_last_fills();
+        }
+    }
+
     pub fn new(
         local: Vec<Box<dyn LocalProcessor<MD>>>,
         exch: Vec<Box<dyn Processor>>,

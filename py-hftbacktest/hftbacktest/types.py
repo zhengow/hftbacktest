@@ -123,3 +123,15 @@ record_dtype = np.dtype(
     ],
     align=True
 )
+
+# Exchange-side diagnostic fills; 64-byte repr(C), independent of Order ABI.
+fill_record_dtype = np.dtype([
+    ('order_id', 'u8'), ('exch_ts', 'i8'), ('price_tick', 'i8'),
+    ('exec_price_tick', 'i8'), ('qty', 'f8'), ('leaves_qty', 'f8'),
+    ('side', 'i8'), ('reason', 'u8'),
+], align=True)
+FILL_TRADE_AT_PRICE = 1
+FILL_TRADE_THROUGH = 2
+FILL_BOOK_TOUCH = 3
+FILL_BOOK_CROSS = 4
+FILL_TAKER = 5

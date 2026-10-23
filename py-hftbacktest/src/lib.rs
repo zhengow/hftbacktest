@@ -115,6 +115,8 @@ pub struct BacktestAsset {
     tick_size: f64,
     lot_size: f64,
     last_trades_cap: usize,
+    record_fill_reasons: bool,
+    book_fill_mode: u8,
     roi_lb: f64,
     roi_ub: f64,
     initial_snapshot: Option<DataSource<Event>>,
@@ -144,6 +146,8 @@ impl BacktestAsset {
             lot_size: 0.0,
             exch_kind: ExchangeKind::NoPartialFillExchange {},
             last_trades_cap: 0,
+            record_fill_reasons: false,
+            book_fill_mode: 0,
             roi_lb: 0.0,
             roi_ub: 0.0,
             initial_snapshot: None,
@@ -445,6 +449,28 @@ impl BacktestAsset {
         slf
     }
 
+    /// Records exchange-side fill causes for diagnostics. Defaults to false.
+    /// Supported by PartialFillExchange; other exchange models reject enabling.
+    /// Drain last_fills(asset_no) and clear_last_fills(asset_no) periodically.
+    /// These are not locally acknowledged fills and must not drive live decisions.
+    pub fn record_fill_reasons(mut slf: PyRefMut<Self>, enabled: bool) -> PyRefMut<Self> {
+        slf.record_fill_reasons = enabled;
+        slf
+    }
+
+    /// Controls passive fills triggered only by replayed book updates.
+    /// 0 (default): touch and cross; 1: strict cross only; 2: trades only.
+    /// Trade/queue fills are unchanged.  Requires PartialFillExchange.
+    pub fn book_fill_mode(mut slf: PyRefMut<Self>, mode: u8) -> PyResult<PyRefMut<Self>> {
+        if mode > 2 {
+            return Err(PyErr::new::<PyValueError, _>(
+                "book_fill_mode must be 0 (touch/cross), 1 (strict cross), or 2 (trades only)",
+            ));
+        }
+        slf.book_fill_mode = mode;
+        Ok(slf)
+    }
+
     /// Sets the initial capacity of the vector storing the last market trades.
     /// The default value is `0`, indicating that no last trades are stored.
     pub fn last_trades_capacity(mut slf: PyRefMut<Self>, capacity: usize) -> PyRefMut<Self> {
@@ -525,7 +551,7 @@ pub fn build_hashmap_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<
             ));
         }
 
-        let asst = build_asset!(
+        let mut asst = build_asset!(
             asset,
             HashMapMarketDepth,
             [
@@ -558,6 +584,16 @@ pub fn build_hashmap_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<
                 FlatPerTradeFeeModel { fees },
             ]
         );
+        if !asst.exch.set_fill_recording(asset.record_fill_reasons) {
+            return Err(PyErr::new::<PyValueError, _>(
+                "record_fill_reasons requires PartialFillExchange",
+            ));
+        }
+        if !asst.exch.set_book_fill_mode(asset.book_fill_mode) {
+            return Err(PyErr::new::<PyValueError, _>(
+                "nonzero book_fill_mode requires PartialFillExchange",
+            ));
+        }
         local.push(asst.local);
         exch.push(asst.exch);
         readers.push(asst.reader);
@@ -582,7 +618,7 @@ pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<u
             ));
         }
 
-        let asst = build_asset!(
+        let mut asst = build_asset!(
             asset,
             ROIVectorMarketDepth,
             [
@@ -615,6 +651,16 @@ pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<u
                 FlatPerTradeFeeModel { fees },
             ]
         );
+        if !asst.exch.set_fill_recording(asset.record_fill_reasons) {
+            return Err(PyErr::new::<PyValueError, _>(
+                "record_fill_reasons requires PartialFillExchange",
+            ));
+        }
+        if !asst.exch.set_book_fill_mode(asset.book_fill_mode) {
+            return Err(PyErr::new::<PyValueError, _>(
+                "nonzero book_fill_mode requires PartialFillExchange",
+            ));
+        }
         local.push(asst.local);
         exch.push(asst.exch);
         readers.push(asst.reader);

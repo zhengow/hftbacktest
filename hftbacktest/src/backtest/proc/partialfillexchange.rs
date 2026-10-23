@@ -5,6 +5,8 @@ use std::{
     rc::Rc,
 };
 
+use super::fill_record::{FillRecord, TRADE_AT_PRICE, TRADE_THROUGH, BOOK_TOUCH, BOOK_CROSS, TAKER};
+
 use crate::{
     backtest::{
         BacktestError,
@@ -96,6 +98,21 @@ where
     queue_model: QM,
 
     filled_orders: Vec<OrderId>,
+
+    // A GTX order that the price crosses within this many nanoseconds of its acceptance is treated
+    // as a post-only rejection instead of a fill. Market data timestamps lag the matching engine, so
+    // such an order would have crossed the book on arrival and been rejected by the venue. Fills
+    // from the queue at the order's own price are kept. Read from
+    // `HFTBACKTEST_POST_ONLY_REJECT_NS`; 0 (the default) disables it.
+    post_only_reject_ns: i64,
+    // Set while filling an order through a trade at a price better than the order's price.
+    trade_through: bool,
+    record_fill_reasons: bool,
+    fill_records: Vec<FillRecord>,
+    trade_trigger: bool,
+    // 0: fill on book touch/cross (legacy); 1: strict cross only; 2: trades only.
+    // This is an execution-sensitivity switch.  It never changes trade/queue fills.
+    book_fill_mode: u8,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -122,6 +139,15 @@ where
             state,
             queue_model,
             filled_orders: Default::default(),
+            post_only_reject_ns: std::env::var("HFTBACKTEST_POST_ONLY_REJECT_NS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            trade_through: false,
+            record_fill_reasons: false,
+            fill_records: Vec::new(),
+            trade_trigger: false,
+            book_fill_mode: 0,
         }
     }
 
@@ -136,13 +162,16 @@ where
             Ordering::Greater => {}
             Ordering::Less => {
                 self.filled_orders.push(order.order_id);
-                return self.fill::<true>(
+                self.trade_through = true;
+                let result = self.fill::<true>(
                     order,
                     timestamp,
                     true,
                     order.price_tick,
                     order.leaves_qty,
                 );
+                self.trade_through = false;
+                return result;
             }
             Ordering::Equal => {
                 // Updates the order's queue position.
@@ -175,13 +204,16 @@ where
         match order.price_tick.cmp(&price_tick) {
             Ordering::Greater => {
                 self.filled_orders.push(order.order_id);
-                return self.fill::<true>(
+                self.trade_through = true;
+                let result = self.fill::<true>(
                     order,
                     timestamp,
                     true,
                     order.price_tick,
                     order.leaves_qty,
                 );
+                self.trade_through = false;
+                return result;
             }
             Ordering::Less => {}
             Ordering::Equal => {
@@ -216,8 +248,34 @@ where
         if order.status == Status::Expired
             || order.status == Status::Canceled
             || order.status == Status::Filled
+            || exec_qty <= 0.0
         {
-            return Err(BacktestError::InvalidOrderStatus);
+            // Price-level iteration can retain an already completed order until
+            // remove_filled_orders runs. Never execute it twice or abort replay.
+            return Ok(());
+        }
+
+        if maker
+            && self.post_only_reject_ns > 0
+            && order.time_in_force == TimeInForce::GTX
+            && order.status == Status::New
+            && timestamp - order.exch_timestamp < self.post_only_reject_ns
+            && (self.trade_through
+                || match order.side {
+                    Side::Buy => self.depth.best_ask_tick() <= order.price_tick,
+                    Side::Sell => self.depth.best_bid_tick() >= order.price_tick,
+                    _ => false,
+                })
+        {
+            order.status = Status::Expired;
+            order.exch_timestamp = timestamp;
+            if !self.filled_orders.contains(&order.order_id) {
+                self.filled_orders.push(order.order_id);
+            }
+            if MAKE_RESPONSE {
+                self.order_e2l.respond(order.clone());
+            }
+            return Ok(());
         }
 
         order.maker = maker;
@@ -237,6 +295,33 @@ where
         order.exch_timestamp = timestamp;
 
         self.state.apply_fill(order);
+
+        if self.record_fill_reasons {
+            let reason = if !maker {
+                TAKER
+            } else if self.trade_through {
+                TRADE_THROUGH
+            } else if self.trade_trigger {
+                TRADE_AT_PRICE
+            } else {
+                let touch = match order.side {
+                    Side::Buy => self.depth.best_ask_tick() == order.price_tick,
+                    Side::Sell => self.depth.best_bid_tick() == order.price_tick,
+                    _ => false,
+                };
+                if touch { BOOK_TOUCH } else { BOOK_CROSS }
+            };
+            self.fill_records.push(FillRecord {
+                order_id: order.order_id,
+                exch_ts: timestamp,
+                price_tick: order.price_tick,
+                exec_price_tick: order.exec_price_tick,
+                qty: exec_qty,
+                leaves_qty: order.leaves_qty,
+                side: if order.side == Side::Buy { 1 } else { -1 },
+                reason,
+            });
+        }
 
         if MAKE_RESPONSE {
             self.order_e2l.respond(order.clone());
@@ -294,6 +379,9 @@ where
         new_best_tick: i64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
+        if self.book_fill_mode == 2 {
+            return Ok(());
+        }
         // If the best has been significantly updated compared to the previous best, it would be
         // better to iterate orders dict instead of order price ladder.
         {
@@ -303,7 +391,11 @@ where
                 || (orders_borrowed.len() as i64) < new_best_tick - prev_best_tick
             {
                 for (_, order) in orders_borrowed.iter_mut() {
-                    if order.side == Side::Sell && order.price_tick <= new_best_tick {
+                    if order.side == Side::Sell
+                        && self.book_fill_mode < 2
+                        && (order.price_tick < new_best_tick
+                            || (self.book_fill_mode == 0 && order.price_tick == new_best_tick))
+                    {
                         self.filled_orders.push(order.order_id);
                         self.fill::<true>(
                             order,
@@ -315,7 +407,12 @@ where
                     }
                 }
             } else {
-                for t in (prev_best_tick + 1)..=new_best_tick {
+                let last_tick = if self.book_fill_mode == 0 {
+                    new_best_tick
+                } else {
+                    new_best_tick - 1
+                };
+                for t in (prev_best_tick + 1)..=last_tick {
                     if let Some(order_ids) = self.sell_orders.get(&t) {
                         for order_id in order_ids.clone().iter() {
                             self.filled_orders.push(*order_id);
@@ -342,6 +439,9 @@ where
         new_best_tick: i64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
+        if self.book_fill_mode == 2 {
+            return Ok(());
+        }
         // If the best has been significantly updated compared to the previous best, it would be
         // better to iterate orders dict instead of order price ladder.
         {
@@ -351,7 +451,11 @@ where
                 || (orders_borrowed.len() as i64) < prev_best_tick - new_best_tick
             {
                 for (_, order) in orders_borrowed.iter_mut() {
-                    if order.side == Side::Buy && order.price_tick >= new_best_tick {
+                    if order.side == Side::Buy
+                        && self.book_fill_mode < 2
+                        && (order.price_tick > new_best_tick
+                            || (self.book_fill_mode == 0 && order.price_tick == new_best_tick))
+                    {
                         self.filled_orders.push(order.order_id);
                         self.fill::<true>(
                             order,
@@ -363,7 +467,12 @@ where
                     }
                 }
             } else {
-                for t in new_best_tick..prev_best_tick {
+                let first_tick = if self.book_fill_mode == 0 {
+                    new_best_tick
+                } else {
+                    new_best_tick + 1
+                };
+                for t in first_tick..prev_best_tick {
                     if let Some(order_ids) = self.buy_orders.get(&t) {
                         for order_id in order_ids.clone().iter() {
                             self.filled_orders.push(*order_id);
@@ -740,11 +849,37 @@ where
     MD: MarketDepth + L2MarketDepth,
     FM: FeeModel,
 {
+    fn set_book_fill_mode(&mut self, mode: u8) -> bool {
+        if mode <= 2 {
+            self.book_fill_mode = mode;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_fill_recording(&mut self, enabled: bool) -> bool {
+        self.record_fill_reasons = enabled;
+        if enabled && self.fill_records.capacity() == 0 {
+            self.fill_records.reserve(1024);
+        }
+        true
+    }
+
+    fn last_fills(&self) -> &[FillRecord] { &self.fill_records }
+
+    fn clear_last_fills(&mut self) { self.fill_records.clear(); }
+
     fn event_seen_timestamp(&self, event: &Event) -> Option<i64> {
         event.is(EXCH_EVENT).then_some(event.exch_ts)
     }
 
     fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
+        // Only enabled diagnostics inspect event kind; the default path never
+        // allocates or writes records. A failed replay is not resumable.
+        if self.record_fill_reasons {
+            self.trade_trigger = event.is(EXCH_BUY_TRADE_EVENT) || event.is(EXCH_SELL_TRADE_EVENT);
+        }
         if event.is(EXCH_BID_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::Buy, event.px);
         } else if event.is(EXCH_ASK_DEPTH_CLEAR_EVENT) {

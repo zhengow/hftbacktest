@@ -545,3 +545,33 @@ pub extern "C" fn roivecbt_order_latency(
         },
     }
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hashmapbt_last_fills(
+    hbt_ptr: *const HashMapMarketDepthBacktest, asset_no: usize, len_ptr: *mut usize,
+) -> *const hftbacktest::backtest::proc::fill_record::FillRecord {
+    let hbt = unsafe { &*hbt_ptr };
+    let fills = hbt.last_fills(asset_no);
+    unsafe { *len_ptr = fills.len(); }
+    fills.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hashmapbt_clear_last_fills(hbt_ptr: *mut HashMapMarketDepthBacktest, asset_no: usize) {
+    unsafe { &mut *hbt_ptr }.clear_last_fills(asset_no);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn roivecbt_last_fills(
+    hbt_ptr: *const ROIVectorMarketDepthBacktest, asset_no: usize, len_ptr: *mut usize,
+) -> *const hftbacktest::backtest::proc::fill_record::FillRecord {
+    let hbt = unsafe { &*hbt_ptr };
+    let fills = hbt.last_fills(asset_no);
+    unsafe { *len_ptr = fills.len(); }
+    fills.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn roivecbt_clear_last_fills(hbt_ptr: *mut ROIVectorMarketDepthBacktest, asset_no: usize) {
+    unsafe { &mut *hbt_ptr }.clear_last_fills(asset_no);
+}

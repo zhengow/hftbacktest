@@ -27,7 +27,7 @@ from . import _hftbacktest
 from .intrinsic import ptr_from_val, address_as_void_pointer, val_from_ptr, is_null_ptr
 from .order import order_dtype, Order, Order_
 from .state import StateValues, StateValues_
-from .types import event_dtype, state_values_dtype, EVENT_ARRAY, DEPTH_EVENT, BUY_EVENT, SELL_EVENT
+from .types import fill_record_dtype, event_dtype, state_values_dtype, EVENT_ARRAY, DEPTH_EVENT, BUY_EVENT, SELL_EVENT
 
 LIVE_FEATURE = 'build_hashmap_livebot' in dir(_hftbacktest)
 
@@ -573,6 +573,16 @@ hashmapbt_depth = lib.hashmapbt_depth
 hashmapbt_depth.restype = c_void_p
 hashmapbt_depth.argtypes = [c_void_p, c_uint64]
 
+# Keep existing backtests importable with an older native ABI. The optional
+# diagnostic methods themselves require rebuilding the extension.
+hashmapbt_last_fills = getattr(lib, "hashmapbt_last_fills", None)
+hashmapbt_clear_last_fills = getattr(lib, "hashmapbt_clear_last_fills", None)
+if hashmapbt_last_fills is not None:
+    hashmapbt_last_fills.restype = c_void_p
+    hashmapbt_last_fills.argtypes = [c_void_p, c_uint64, POINTER(c_uint64)]
+    hashmapbt_clear_last_fills.restype = None
+    hashmapbt_clear_last_fills.argtypes = [c_void_p, c_uint64]
+
 hashmapbt_last_trades = lib.hashmapbt_last_trades
 hashmapbt_last_trades.restype = c_void_p
 hashmapbt_last_trades.argtypes = [c_void_p, c_uint64, POINTER(c_uint64)]
@@ -738,6 +748,26 @@ class HashMapMarketDepthBacktest:
             :class:`Order <hftbacktest.order.Order>`.
         """
         return OrderDict_(hashmapbt_orders(self.ptr, asset_no))
+
+    def last_fills(self, asset_no: uint64):
+        """Exchange-side diagnostic fills; consume/copy before advancing or clearing.
+
+        Enabled by BacktestAsset.record_fill_reasons(True). These events can
+        precede local acknowledgements: never feed them into strategy decisions.
+        """
+        length = uint64(0)
+        len_ptr = ptr_from_val(length)
+        if hashmapbt_last_fills is None:
+            raise RuntimeError("Rebuild native extension to enable fill diagnostics")
+        ptr = hashmapbt_last_fills(self.ptr, asset_no, len_ptr)
+        return numba.carray(address_as_void_pointer(ptr), val_from_ptr(len_ptr), fill_record_dtype)
+
+    def clear_last_fills(self, asset_no: uint64) -> None:
+        """Clear diagnostics while retaining buffer capacity; ALL_ASSETS supported."""
+        if hashmapbt_clear_last_fills is None:
+            raise RuntimeError("Rebuild native extension to enable fill diagnostics")
+        hashmapbt_clear_last_fills(self.ptr, asset_no)
+
 
     def submit_buy_order(
             self,
@@ -1020,6 +1050,16 @@ roivecbt_depth = lib.roivecbt_depth
 roivecbt_depth.restype = c_void_p
 roivecbt_depth.argtypes = [c_void_p, c_uint64]
 
+# Keep existing backtests importable with an older native ABI. The optional
+# diagnostic methods themselves require rebuilding the extension.
+roivecbt_last_fills = getattr(lib, "roivecbt_last_fills", None)
+roivecbt_clear_last_fills = getattr(lib, "roivecbt_clear_last_fills", None)
+if roivecbt_last_fills is not None:
+    roivecbt_last_fills.restype = c_void_p
+    roivecbt_last_fills.argtypes = [c_void_p, c_uint64, POINTER(c_uint64)]
+    roivecbt_clear_last_fills.restype = None
+    roivecbt_clear_last_fills.argtypes = [c_void_p, c_uint64]
+
 roivecbt_last_trades = lib.roivecbt_last_trades
 roivecbt_last_trades.restype = c_void_p
 roivecbt_last_trades.argtypes = [c_void_p, c_uint64, POINTER(c_uint64)]
@@ -1181,6 +1221,26 @@ class ROIVectorMarketDepthBacktest:
             :class:`Order <hftbacktest.order.Order>`.
         """
         return OrderDict_(roivecbt_orders(self.ptr, asset_no))
+
+    def last_fills(self, asset_no: uint64):
+        """Exchange-side diagnostic fills; consume/copy before advancing or clearing.
+
+        Enabled by BacktestAsset.record_fill_reasons(True). These events can
+        precede local acknowledgements: never feed them into strategy decisions.
+        """
+        length = uint64(0)
+        len_ptr = ptr_from_val(length)
+        if roivecbt_last_fills is None:
+            raise RuntimeError("Rebuild native extension to enable fill diagnostics")
+        ptr = roivecbt_last_fills(self.ptr, asset_no, len_ptr)
+        return numba.carray(address_as_void_pointer(ptr), val_from_ptr(len_ptr), fill_record_dtype)
+
+    def clear_last_fills(self, asset_no: uint64) -> None:
+        """Clear diagnostics while retaining buffer capacity; ALL_ASSETS supported."""
+        if roivecbt_clear_last_fills is None:
+            raise RuntimeError("Rebuild native extension to enable fill diagnostics")
+        roivecbt_clear_last_fills(self.ptr, asset_no)
+
 
     def submit_buy_order(
             self,

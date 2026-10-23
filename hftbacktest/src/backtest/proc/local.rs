@@ -99,7 +99,12 @@ where
             }
 
             // Processes receiving order response.
-            if order.status == Status::Filled {
+            let previous_cumulative = self.orders.get(&order.order_id)
+                .map(|previous| previous.qty - previous.leaves_qty).unwrap_or(0.0);
+            let new_partial_fill = order.status == Status::PartiallyFilled
+                && order.qty - order.leaves_qty > previous_cumulative + 1e-12;
+            if (order.status == Status::Filled || new_partial_fill)
+                && order.req != Status::Rejected && order.exec_qty > 0.0 {
                 self.state.apply_fill(&order);
             }
             // Applies the received order response to the local orders.
