@@ -100,9 +100,9 @@ where
     filled_orders: Vec<OrderId>,
 
     // A GTX order that the price crosses within this many nanoseconds of its acceptance is treated
-    // as a post-only rejection instead of a fill. Market data timestamps lag the matching engine, so
-    // such an order would have crossed the book on arrival and been rejected by the venue. Fills
-    // from the queue at the order's own price are kept. Read from
+    // as a post-only rejection instead of a fill. This is an optional compensation heuristic
+    // for coarse/lagging market data, not proof the order crossed on arrival. With high-frequency
+    // fused depth it can reject legitimate fast maker fills; prefer leaving it disabled. Read from
     // `HFTBACKTEST_POST_ONLY_REJECT_NS`; 0 (the default) disables it.
     post_only_reject_ns: i64,
     // Set while filling an order through a trade at a price better than the order's price.

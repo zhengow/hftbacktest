@@ -71,6 +71,20 @@ only the EXCH payload with an own-corrected book preserves the recorded causal
 LOCAL observations; do not accidentally reconstruct LOCAL data from that corrected
 exchange book. This adapter never needs private order/fill records.
 
+## PostOnly replay setting
+
+The engine's optional `HFTBACKTEST_POST_ONLY_REJECT_NS` environment variable is
+read when each exchange model is constructed; its native default is **0**.
+Zero disables only the extra rule that treats an early book/trade crossing as
+an arrival-time rejection. Normal GTX/PostOnly rejection against the book on
+order arrival remains active. Changing the environment after construction does
+not reconfigure an existing backtest.
+
+Do not automatically carry a coarse-data 20ms compensation window into this
+high-frequency fused feed. It can reject genuine fast maker fills. Measure actual
+order rejection timing and check admission-time book state first. Private cTime
+to terminal time is not the same quantity as time to the next public depth push.
+
 Tests:
 
 ```sh
