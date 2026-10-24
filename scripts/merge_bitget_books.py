@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge one Bitget V3 books/books5/books1 capture into causal L2 views.
+"""Merge a Bitget capture or historical L2 + book_ticker CSV into causal views.
 
 No exchange API or private-account access. Core matching code is unchanged.
 See scripts/README.md for format, ordering and limitations.
@@ -10,19 +10,26 @@ import argparse
 import bisect
 import csv
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+import gzip
 import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
 import time
 
 PRIORITY = {'books': 0, 'books5': 1, 'books1': 2}
 DEPTH_FIELDS = ['exchange','symbol','timestamp','local_timestamp','is_snapshot','side','price','amount']
 TRADE_FIELDS = ['exchange','symbol','timestamp','local_timestamp','id','side','price','amount']
 START = time.monotonic()
+NATIVE = Path(__file__).resolve().parent/'bitget_merge_native'
 
 
 def log(message):
@@ -44,6 +51,7 @@ class Frame:
     @property
     def clock(self):
         # seq is only compared within a channel (priority is before seq).
+        # Historical CSV uses source row order here, never a venue sequence.
         return self.ts, PRIORITY[self.topic], self.seq
 
 
@@ -274,6 +282,135 @@ def load(path, symbol, tick):
     return frames,trades,dict(counts),connection
 
 
+@contextmanager
+def csv_input(path):
+    """Read plain, gzip or zstd CSV without extracting whole files to disk."""
+    if path.name.endswith('.zst'):
+        import zstandard
+        with path.open('rb') as f, zstandard.ZstdDecompressor().stream_reader(f) as reader:
+            with io.TextIOWrapper(reader, newline='') as text:
+                yield text
+    elif path.name.endswith('.gz'):
+        with gzip.open(path, 'rt', newline='') as f:
+            yield f
+    else:
+        with path.open(newline='') as f:
+            yield f
+
+
+def historical_paths(args):
+    explicit=[args.depth_file,args.book_ticker_file,args.trades_file]
+    if any(explicit):
+        if not all(explicit):
+            raise ValueError('Historical mode requires --depth-file, --book-ticker-file and --trades-file together')
+        if not all(p.is_file() for p in explicit):
+            raise ValueError('A historical input file does not exist')
+        return tuple(explicit)
+    if args.input is None or not args.input.is_dir():
+        raise ValueError('Historical input must be a directory, or provide all three explicit CSV file paths')
+    date=args.date
+    if date:
+        date=datetime.strptime(date.replace('-',''),'%Y%m%d').strftime('%Y%m%d')
+    types=('incremental_book_L2','book_ticker','trades')
+    found={}
+    for kind in types:
+        pattern=re.compile(rf'^bitget-futures_{kind}_{re.escape(args.symbol)}_(\d{{8}})\.csv(?:\.zst|\.gz)?$')
+        for path in args.input.iterdir():
+            match=pattern.match(path.name)
+            if match and (not date or match[1]==date):
+                if (kind,match[1]) in found:
+                    raise ValueError(f'Duplicate CSV copies for {kind} {match[1]}; use explicit paths')
+                found[kind,match[1]]=path
+    dates={d for _,d in found}
+    if len(dates)!=1:
+        raise ValueError('Select exactly one historical day with --date YYYYMMDD; use a separate output per day')
+    day=next(iter(dates))
+    missing=[kind for kind in types if (kind,day) not in found]
+    if missing:
+        raise ValueError('Missing historical CSV types: '+', '.join(missing))
+    return tuple(found[kind,day] for kind in types)
+
+
+def load_historical(depth_file, ticker_file, trades_file, symbol, tick):
+    """CSV has no venue sequence or connection ID: do not fabricate either.
+
+    Frame.seq is an internal CSV ordinal only. Raw protocol continuity cannot
+    be verified. Adjacent depth rows with identical timestamps/snapshot flag
+    form one frame; CSV does not retain original WebSocket message boundaries.
+    """
+    frames,trades,counts=[],[],Counter()
+    def rows(path, fields):
+        with csv_input(path) as f:
+            reader=csv.DictReader(f)
+            if not fields.issubset(reader.fieldnames or []):
+                raise ValueError(f'{path.name}: missing columns {sorted(fields-set(reader.fieldnames or []))}')
+            for number,r in enumerate(reader,1):
+                if r['exchange']!='bitget-futures' or r['symbol']!=symbol:
+                    raise ValueError(f'{path.name}:{number}: wrong exchange or symbol')
+                ts,local=int(r['timestamp']),int(r['local_timestamp'])
+                if ts<=0 or local<=0:
+                    raise ValueError(f'{path.name}:{number}: timestamps must be positive Unix microseconds')
+                if number%1_000_000==0:
+                    log(f'历史 CSV {path.name} 已读取 {number:,} 行')
+                yield r,ts,local
+    def level(price,qty):
+        price,qty=float(price),float(qty)
+        if not math.isfinite(price) or not math.isfinite(qty) or price<=0 or qty<0:
+            raise ValueError('Invalid historical price/quantity')
+        p=round(price/tick)
+        if p >= (1<<63) or abs(price-p*tick)>tick*1e-5:
+            raise ValueError('Historical price is not aligned to supplied tick size')
+        return p,qty
+    common={'exchange','symbol','timestamp','local_timestamp'}
+    group=None;bids=[];asks=[]
+    def flush():
+        if group is not None:
+            ts,local,snapshot=group
+            ordinal=counts['books']+1
+            frames.append(Frame(ts,local,'books',ordinal,'snapshot' if snapshot else 'update',
+                                bids,asks,len(frames)+1))
+            counts['books']+=1
+            counts['historical_full_snapshots']+=int(snapshot)
+    for r,ts,local in rows(depth_file,common|{'is_snapshot','side','price','amount'}):
+        flag=r['is_snapshot'].lower()
+        if flag not in ('true','false','1','0'):
+            raise ValueError('Invalid is_snapshot in historical L2')
+        key=(ts,local,flag in ('true','1'))
+        if key!=group:
+            flush();group=key;bids=[];asks=[]
+        if r['side'] not in ('bid','ask','buy','sell'):
+            raise ValueError('Invalid historical depth side')
+        (bids if r['side'] in ('bid','buy') else asks).append(level(r['price'],r['amount']))
+    flush()
+    if not frames or frames[0].action!='snapshot':
+        raise ValueError('Historical L2 must begin with a complete snapshot')
+    for r,ts,local in rows(ticker_file,common|{'bid_price','bid_amount','ask_price','ask_amount'}):
+        bids=[level(r['bid_price'],r['bid_amount'])]
+        asks=[level(r['ask_price'],r['ask_amount'])]
+        if bids[0][1]<=0 or asks[0][1]<=0 or bids[0][0]>=asks[0][0]:
+            raise ValueError('Historical book_ticker requires positive sizes and bid < ask')
+        ordinal=counts['books1']+1
+        frames.append(Frame(ts,local,'books1',ordinal,'snapshot',bids,asks,len(frames)+1))
+        counts['books1']+=1
+    if not counts['books1']:
+        raise ValueError('Empty historical book_ticker')
+    seen={}
+    for r,ts,local in rows(trades_file,common|{'id','side','price','amount'}):
+        if r['side'] not in ('buy','sell') or not r['id']:
+            raise ValueError('Invalid historical Trade side or ID')
+        p,q=level(r['price'],r['amount'])
+        if q<=0:raise ValueError('Historical Trade quantity must be positive')
+        value=(ts,r['side'],p,q)
+        if r['id'] in seen:
+            if seen[r['id']]!=value:raise ValueError('Conflicting duplicate historical Trade ID')
+            counts['duplicate_trades']+=1;continue
+        seen[r['id']]=value
+        trades.append((ts,local,r['id'],r['side'],r['price'],r['amount']))
+    # Already-grouped frame lists may not be ordered by exchange time. Each
+    # causal view is sorted independently by merge_view, just as for raw input.
+    return frames,trades,dict(counts),None
+
+
 def merge_view(frames, output, symbol, tick, view):
     state=Merger();rows=0
     order=sorted(range(len(frames)),key=lambda i:
@@ -336,39 +473,132 @@ def build_npz(output, filename):
                 local_view='independent receive-order fusion; payload may differ from exchange view')
 
 
+def native_binary():
+    binary=NATIVE/'target/release/bitget-merge-native'
+    sources=[NATIVE/'Cargo.toml',NATIVE/'Cargo.lock',*NATIVE.glob('src/**/*.rs')]
+    modified=max(p.stat().st_mtime_ns for p in sources if p.exists())
+    if not binary.exists() or binary.stat().st_mtime_ns<modified:
+        if not shutil.which('cargo'):
+            raise ValueError('Rust backend needs cargo for the first build; install Rust or use --backend python')
+        log('首次构建或更新 Rust 历史融合后端（编译最多使用 2 个任务）')
+        env=dict(os.environ,CARGO_TARGET_DIR=str(NATIVE/'target'))
+        subprocess.run(['cargo','build','--locked','--release','--manifest-path',str(NATIVE/'Cargo.toml'),'-j','2'],env=env,check=True)
+    return binary
+
+
+def run_native(paths,args):
+    binary=native_binary()
+    with binary.open('rb') as f:
+        binary_hash=hashlib.file_digest(f,'sha256').hexdigest()
+    command=[str(binary),*(str(p.resolve()) for p in paths),str(args.output.resolve()),args.symbol,str(args.tick_size)]
+    command+=['--jobs',str(args.jobs)]
+    if args.build_npz:command.append('--build-npz')
+    if args.npz_only:command.append('--npz-only')
+    log('Rust：解压/解析历史数据、融合独立时间视角、流式输出')
+    subprocess.run(command,check=True)
+    result=json.loads((args.output/'native_summary.json').read_text())
+    result['native_binary_sha256']=binary_hash
+    return result
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--input',required=True,type=Path)
+    p.add_argument('--input',type=Path,help='Sealed raw journal/file, or historical CSV directory')
+    p.add_argument('--input-format',choices=['auto','raw','csv'],default='auto')
+    p.add_argument('--backend',choices=['auto','python','rust'],default='auto',
+                   help='auto: prefer Rust for historical CSV; raw capture uses Python')
+    p.add_argument('--jobs',type=int,choices=[1,2],default=2,
+                   help='Rust fusion workers: 2 independent time views by default; use 1 to reduce CPU/memory')
+    p.add_argument('--date',help='Historical CSV day, YYYYMMDD or YYYY-MM-DD')
+    p.add_argument('--depth-file',type=Path,help='Explicit incremental_book_L2 CSV[.gz/.zst]')
+    p.add_argument('--book-ticker-file',type=Path,help='Explicit book_ticker CSV[.gz/.zst]')
+    p.add_argument('--trades-file',type=Path,help='Explicit trades CSV[.gz/.zst]')
     p.add_argument('--output',required=True,type=Path)
     p.add_argument('--symbol',required=True)
     p.add_argument('--tick-size',required=True,type=float)
     p.add_argument('--build-npz',action='store_true')
+    p.add_argument('--npz-only',action='store_true',help='Rust historical mode: write market.npz and metadata without large CSV outputs; implies --build-npz')
     p.add_argument('-f','--force',action='store_true')
     args=p.parse_args()
     if not math.isfinite(args.tick_size) or args.tick_size<=0:p.error('tick-size must be positive')
+    if args.input is None and not any([args.depth_file,args.book_ticker_file,args.trades_file]):
+        p.error('Provide --input, or all three historical CSV paths')
+    if args.input is not None and not args.input.exists():p.error('Input does not exist')
+    mode=args.input_format
+    if mode=='auto':
+        raw=args.input is not None and (
+            args.input.is_dir() and any(args.input.glob('events_*.jsonl.zst'))
+            or args.input.is_file() and '.jsonl' in args.input.name)
+        mode='raw' if raw and not any([args.depth_file,args.book_ticker_file,args.trades_file]) else 'csv'
+    if mode=='raw' and (args.input is None or args.date or any([args.depth_file,args.book_ticker_file,args.trades_file])):
+        p.error('Raw mode requires --input and does not accept historical CSV/date options')
+    if mode=='raw' and args.backend=='rust':p.error('Rust backend currently supports historical CSV; use --backend python or auto for raw capture')
+    backend=args.backend
+    if backend=='auto':
+        available=(NATIVE/'target/release/bitget-merge-native').exists() or shutil.which('cargo')
+        backend='rust' if mode=='csv' and available else 'python'
+        if mode=='csv' and backend=='python':log('未找到 Rust 后端/编译器，使用 Python；可安装 Rust 以加速历史融合')
+    if args.npz_only:
+        if backend!='rust':p.error('--npz-only requires Rust historical backend')
+        args.build_npz=True
+    try:
+        paths=historical_paths(args) if mode=='csv' else None
+    except ValueError as error:
+        p.error(str(error))
+    generated=['depth.csv','depth_local.csv','trades.csv','market.npz','native_summary.json','summary.json']
+    if paths and any(path.resolve() in {(args.output/name).resolve() for name in generated} for path in paths):
+        p.error('Output files would overwrite historical input; use a separate output directory')
     if args.output.exists() and any(args.output.iterdir()) and not args.force:
         p.error('Output exists; choose a new directory or pass -f')
     args.output.mkdir(parents=True,exist_ok=True)
     (args.output/'summary.json').unlink(missing_ok=True)
-    log('读取三个盘口频道及公开 Trade；只处理一个健康连接')
-    frames,trades,counts,connection=load(args.input,args.symbol,args.tick_size)
-    log(f'读取完成：{len(frames):,} 帧，{len(trades):,} 笔公开成交')
-    summary=dict(symbol=args.symbol,tick_size=args.tick_size,connection_id=connection,channels=counts,
-                 trade_rows=len(trades),tie_policy='row timestamp, then books < books5 < books1; seq only within channel',
+    if args.force:
+        for name in ['depth.csv','depth_local.csv','trades.csv','market.npz','native_summary.json']:
+            (args.output/name).unlink(missing_ok=True)
+    native=None
+    if backend=='rust':
+        native=run_native(paths,args)
+        counts=native['channels'];connection=None;trade_rows=native['trade_rows']
+    elif mode=='raw':
+        log('读取三个盘口频道及公开 Trade；只处理一个健康连接')
+        frames,trades,counts,connection=load(args.input,args.symbol,args.tick_size)
+    else:
+        log('读取历史 L2 + book_ticker + trades CSV；不伪造序列号或独立 books5')
+        frames,trades,counts,connection=load_historical(*paths,args.symbol,args.tick_size)
+    if native is None:
+        log(f'读取完成：{len(frames):,} 帧，{len(trades):,} 笔公开成交')
+        trade_rows=len(trades)
+    summary=dict(symbol=args.symbol,tick_size=args.tick_size,input_format=mode,backend=backend,connection_id=connection,channels=counts,
+                 trade_rows=trade_rows,tie_policy=('row timestamp, then books < books5 < books1; seq only within channel'
+                     if mode=='raw' else 'row timestamp, then L2 < book_ticker; source CSV order within each stream; equal receive-time ties use L2 before book_ticker'),
                  sources=['https://www.bitget.com/docs/uta/websocket/public/Order-Book-Channel',
                           'https://www.bitget.com/docs/uta/best-practices-guide'])
-    for view,name in [('exchange','depth.csv'),('local','depth_local.csv')]:
-        summary[view]=merge_view(frames,args.output/name,args.symbol,args.tick_size,view)
-    with (args.output/'trades.csv').open('w',newline='') as f:
-        w=csv.writer(f);w.writerow(TRADE_FIELDS)
-        for t in trades:w.writerow(['bitget-futures',args.symbol,*t])
-    if args.build_npz:
-        log('构造 hftbacktest EXCH/LOCAL 独立事件流')
-        summary['npz']=build_npz(args.output,args.output/'market.npz')
-    summary['elapsed_seconds']=time.monotonic()-START
-    for name in ['depth.csv','depth_local.csv','trades.csv']:
+    if mode=='csv':
+        summary['historical']=dict(files={kind:str(path.resolve()) for kind,path in
+            zip(['incremental_book_L2','book_ticker','trades'],paths)},
+            venue_sequence_available=False,sequence_continuity_verified=False,
+            internal_order='CSV ordinal is an internal tiebreaker, not a reconstructed exchange sequence',
+            frame_boundaries='Adjacent L2 rows sharing exchange/receive timestamps and snapshot flag; original message boundaries unavailable',
+            independent_books5=False,
+            limitations=['No seq/pseq or connection ID: cannot verify original packet continuity or connection identity.',
+                         'book_snapshot_5 is not used as a native high-frequency books5 feed.',
+                         'CSV row order breaks same-channel timestamp ties; cross-channel physical order remains uncertain.',
+                         'Repeated L2 snapshots reset the visible book; retained in historical_full_snapshots count.'])
+    if native is not None:
+        summary.update(native)
+    else:
+        for view,name in [('exchange','depth.csv'),('local','depth_local.csv')]:
+            summary[view]=merge_view(frames,args.output/name,args.symbol,args.tick_size,view)
+        with (args.output/'trades.csv').open('w',newline='') as f:
+            w=csv.writer(f);w.writerow(TRADE_FIELDS)
+            for t in trades:w.writerow(['bitget-futures',args.symbol,*t])
+        if args.build_npz:
+            log('构造 hftbacktest EXCH/LOCAL 独立事件流')
+            summary['npz']=build_npz(args.output,args.output/'market.npz')
+    for name in (['market.npz'] if args.npz_only else ['depth.csv','depth_local.csv','trades.csv']):
         with (args.output/name).open('rb') as f:
             summary.setdefault('sha256',{})[name]=hashlib.file_digest(f,'sha256').hexdigest()
+    summary['elapsed_seconds']=time.monotonic()-START
     (args.output/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
     log(json.dumps(summary,ensure_ascii=False))
 

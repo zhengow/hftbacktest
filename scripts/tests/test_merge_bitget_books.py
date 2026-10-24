@@ -5,6 +5,9 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import gzip
+import subprocess
+import random
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import merge_bitget_books as m
@@ -119,6 +122,182 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(trades[0][2],'one')
             self.assertEqual(counts['ignored_trade_history_rows'],1)
             self.assertEqual(counts['duplicate_trades'],1)
+
+
+class HistoricalTests(unittest.TestCase):
+    def fixture(self, root):
+        """Stale L2 must not resurrect a better quote after faster BBO retreat."""
+        names=['bitget-futures_incremental_book_L2_TEST_20260916.csv',
+               'bitget-futures_book_ticker_TEST_20260916.csv.gz',
+               'bitget-futures_trades_TEST_20260916.csv.zst']
+        depth='exchange,symbol,timestamp,local_timestamp,is_snapshot,side,price,amount\n'
+        depth+='bitget-futures,TEST,1000,1100,true,bid,100,1\n'
+        depth+='bitget-futures,TEST,1000,1100,true,bid,99,2\n'
+        depth+='bitget-futures,TEST,1000,1100,true,ask,102,1\n'
+        depth+='bitget-futures,TEST,1000,1100,true,ask,103,2\n'
+        depth+='bitget-futures,TEST,1500,2100,false,bid,100,8\n'
+        ticker='exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_price,bid_amount\n'
+        ticker+='bitget-futures,TEST,2000,2050,1,102,99,.5\n'
+        trades='exchange,symbol,timestamp,local_timestamp,id,side,price,amount\n'
+        trades+='bitget-futures,TEST,2200,2250,t1,sell,99,.5\n'
+        import zstandard
+        (root/names[0]).write_text(depth)
+        with gzip.open(root/names[1],'wt') as f:f.write(ticker)
+        (root/names[2]).write_bytes(zstandard.ZstdCompressor().compress(trades.encode()))
+        return [root/name for name in names]
+
+    def test_csv_fusion_removes_stale_best_without_fabricated_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);paths=self.fixture(root)
+            frames,trades,counts,connection=m.load_historical(*paths,'TEST',1.)
+            self.assertIsNone(connection)
+            self.assertEqual(counts['books'],2)
+            self.assertEqual(counts['books1'],1)
+            self.assertNotIn('books5',counts)
+            self.assertEqual(trades[0][:3],(2200,2250,'t1'))
+            for view in ['exchange','local']:
+                m.merge_view(frames,root/(view+'.csv'),'TEST',1.,view)
+                with (root/(view+'.csv')).open() as f:rows=list(csv.DictReader(f))
+                book={}
+                for r in rows:
+                    if r['side']=='bid':book[float(r['price'])]=float(r['amount'])
+                self.assertEqual(book[100.],0.)
+                self.assertEqual(book[99.],.5)
+
+    def test_historical_cli_auto_discovery_builds_valid_npz(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);self.fixture(root)
+            command=[sys.executable,str(Path(m.__file__)), '--input',str(root),
+                     '--output',str(root/'out'),'--symbol','TEST','--tick-size','1',
+                     '--date','2026-09-16','--build-npz']
+            result=subprocess.run(command,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            summary=json.loads((root/'out/summary.json').read_text())
+            self.assertEqual(summary['input_format'],'csv')
+            self.assertFalse(summary['historical']['sequence_continuity_verified'])
+            self.assertTrue(summary['npz']['events']>0)
+
+    def test_missing_initial_snapshot_and_wrong_symbol_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);paths=self.fixture(root)
+            with self.assertRaisesRegex(ValueError,'wrong exchange or symbol'):
+                m.load_historical(*paths,'OTHER',1.)
+            text=paths[0].read_text();paths[0].write_text(text.replace(',true,',',false,'))
+            with self.assertRaisesRegex(ValueError,'begin with a complete snapshot'):
+                m.load_historical(*paths,'TEST',1.)
+
+    def test_ambiguous_day_requires_selection(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);paths=self.fixture(root)
+            (root/paths[0].name.replace('20260916','20260917')).write_text(paths[0].read_text())
+            args=argparse.Namespace(input=root,date=None,symbol='TEST',depth_file=None,
+                                    book_ticker_file=None,trades_file=None)
+            with self.assertRaisesRegex(ValueError,'exactly one historical day'):
+                m.historical_paths(args)
+
+    def test_explicit_paths_are_supported_and_partial_set_is_rejected(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as tmp:
+            paths=self.fixture(Path(tmp))
+            args=argparse.Namespace(input=None,date=None,symbol='TEST',depth_file=paths[0],
+                                    book_ticker_file=paths[1],trades_file=paths[2])
+            self.assertEqual(m.historical_paths(args),tuple(paths))
+            args.trades_file=None
+            with self.assertRaisesRegex(ValueError,'together'):m.historical_paths(args)
+
+
+@unittest.skipUnless((m.NATIVE/'target/release/bitget-merge-native').exists(), 'Build Rust backend before native parity tests')
+class NativeParityTests(unittest.TestCase):
+    def compare_backends(self,root,paths):
+        import numpy as np
+        outputs=[]
+        for backend in ['python','rust']:
+            out=root/backend
+            cmd=[sys.executable,str(Path(m.__file__)),'--depth-file',str(paths[0]),
+                 '--book-ticker-file',str(paths[1]),'--trades-file',str(paths[2]),
+                 '--output',str(out),'--symbol','TEST','--tick-size','1',
+                 '--build-npz','--backend',backend]
+            result=subprocess.run(cmd,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            outputs.append(out)
+        a=np.load(outputs[0]/'market.npz')['data'];b=np.load(outputs[1]/'market.npz')['data']
+        self.assertEqual(a.dtype,b.dtype)
+        np.testing.assert_array_equal(a,b)
+        sa,sb=[json.loads((out/'summary.json').read_text()) for out in outputs]
+        for view in ['exchange','local']:
+            for key,value in sa[view].items():self.assertEqual(value,sb[view][key],(view,key))
+        self.assertEqual(sa['trade_rows'],sb['trade_rows'])
+        for name in ['depth.csv','depth_local.csv','trades.csv']:
+            # Text float formatting differs; semantic rows must be identical.
+            with (outputs[0]/name).open() as f:ra=list(csv.DictReader(f))
+            with (outputs[1]/name).open() as f:rb=list(csv.DictReader(f))
+            self.assertEqual(len(ra),len(rb))
+            for x,y in zip(ra,rb):
+                for k in x:
+                    self.assertEqual(float(x[k]),float(y[k])) if k in ['price','amount'] else self.assertEqual(x[k],y[k])
+
+    def test_native_matches_reference_with_compression_and_late_l2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);paths=HistoricalTests.fixture(self,root)
+            self.compare_backends(root,paths)
+
+    def test_npz_only_and_single_worker_match_reference_without_csv_files(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);paths=HistoricalTests.fixture(self,root)
+            self.compare_backends(root,paths)
+            out=root/'fast'
+            cmd=[sys.executable,str(Path(m.__file__)),'--depth-file',str(paths[0]),
+                 '--book-ticker-file',str(paths[1]),'--trades-file',str(paths[2]),
+                 '--output',str(out),'--symbol','TEST','--tick-size','1',
+                 '--npz-only','--backend','rust','--jobs','1']
+            result=subprocess.run(cmd,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            np.testing.assert_array_equal(np.load(root/'python/market.npz')['data'],np.load(out/'market.npz')['data'])
+            for name in ['depth.csv','depth_local.csv','trades.csv','.exchange.events','.local.events','market.npz.part']:
+                self.assertFalse((out/name).exists(),name)
+            summary=json.loads((out/'summary.json').read_text())
+            self.assertEqual(summary['jobs'],1)
+            self.assertFalse(summary['csv_written'])
+            self.assertIn('market.npz',summary['sha256'])
+
+    def test_native_error_cleans_temporary_events_and_does_not_mark_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);paths=HistoricalTests.fixture(self,root)
+            # Invalid latency is discovered while emitting native events.
+            text=paths[0].read_text().replace(',1000,1100,',',1000,999,')
+            paths[0].write_text(text)
+            out=root/'bad'
+            cmd=[sys.executable,str(Path(m.__file__)),'--depth-file',str(paths[0]),
+                 '--book-ticker-file',str(paths[1]),'--trades-file',str(paths[2]),
+                 '--output',str(out),'--symbol','TEST','--tick-size','1','--npz-only','--backend','rust']
+            result=subprocess.run(cmd,capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('negative feed latency',result.stdout+result.stderr)
+            for name in ['summary.json','.exchange.events','.local.events','market.npz.part']:
+                self.assertFalse((out/name).exists(),name)
+
+    def test_native_matches_randomized_resets_ties_and_crossed_views(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);paths=[root/name for name in ['depth.csv','ticker.csv','trades.csv']]
+            rng=random.Random(20261024)
+            def save(path,fields,rows):
+                with path.open('w',newline='') as f:
+                    w=csv.writer(f);w.writerow(fields);w.writerows(rows)
+            depth=[];ticker=[];trades=[];base=1_700_000_000_000_000
+            for i in range(300):
+                ts=base+i*1000;local=ts+rng.randint(1,2500)
+                snapshot=i in (0,80,160)
+                for side,price in [('bid',100+rng.randrange(-3,2)),('ask',105+rng.randrange(-2,3))]:
+                    depth.append(['bitget-futures','TEST',ts,local,str(snapshot).lower(),side,price,rng.choice([.005,.01,.1,1.,0.])])
+                bt=ts+rng.choice([0,1,500]);bl=bt+rng.randint(1,2500)
+                ticker.append(['bitget-futures','TEST',bt,bl,rng.choice([.005,1.,2.]),rng.randrange(102,108),rng.randrange(96,102),rng.choice([.005,.1,1.])])
+                trades.append(['bitget-futures','TEST',ts+600,ts+4000,str(i),rng.choice(['buy','sell']),rng.randrange(99,107),.005])
+            save(paths[0],m.DEPTH_FIELDS,depth)
+            save(paths[1],['exchange','symbol','timestamp','local_timestamp','ask_amount','ask_price','bid_price','bid_amount'],ticker)
+            save(paths[2],m.TRADE_FIELDS,trades)
+            self.compare_backends(root,paths)
 
 
 if __name__=='__main__':unittest.main()

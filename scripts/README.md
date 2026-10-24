@@ -1,4 +1,4 @@
-# Bitget V3 multi-channel replay
+# Bitget multi-channel replay
 
 `merge_bitget_books.py` is an exchange-specific data adapter. It does not change
 hftbacktest matching rules, PostOnly behavior, or fill reason definitions.
@@ -14,7 +14,104 @@ Existing output is protected; pass `-f` to regenerate. Progress is printed while
 reading and merging. Compressed input requires `zstandard`; NPZ generation also
 requires the normal hftbacktest, NumPy and Polars dependencies.
 
-## Input
+## Performance backends
+
+Historical CSV mode now defaults to the Rust backend when Cargo or a prebuilt
+native binary is available. Raw journal mode keeps the Python implementation.
+The Python command and output event semantics remain compatible. Use
+`--backend python` for the reference implementation, or `--backend rust` to
+require native execution. `summary.json` identifies the selected backend.
+
+The first Rust run builds `scripts/bitget_merge_native` automatically with at
+most two compile jobs. Later runs reuse the binary; source changes trigger a
+rebuild. Cargo may download build dependencies on first use; the data conversion
+itself does not download market data or access exchange accounts. Build files
+live inside that standalone crate, separate from the main workspace.
+
+For historical backtests, the fastest output mode is:
+
+```sh
+python scripts/merge_bitget_books.py \
+  --input mm_strategy/data_buy/zecusdt --date 20260916 \
+  --output mm_strategy/model_v1/merged_books/ZECUSDT/20260916 \
+  --symbol ZECUSDT --tick-size 0.01 --npz-only
+```
+
+`--npz-only` implies `--build-npz` and writes `market.npz` plus metadata without
+the large depth/trade CSV outputs. It requires the Rust historical backend.
+For diagnostic CSVs and NPZ together, use `--build-npz` instead. Both produce the
+same numeric event stream; textual floating-point formatting may differ between
+Python and Rust CSVs.
+
+Rust uses compact frames/levels instead of Python objects per level, independently
+sorts the two causal views, and streams a four-way merge directly into a standard
+NumPy NPZ/NPY container. It does not create or globally sort a full event array.
+Intermediate event files are removed on success or normal error return. ZIP64
+supports large daily outputs. No hftbacktest engine modifications are required.
+
+`--jobs 2` (default) uses one worker for each time view; `--jobs 1` reduces CPU
+and index memory. Parsing and final NPZ writing are sequential. Frames and levels
+remain in compact memory for the selected day; this is not an unbounded-memory
+multi-month importer. Process days sequentially, and start with one symbol per
+process. Logs include phase progress and fusion-stage ETA. The summary records
+phase timings, worker count and native binary SHA256.
+
+Output protection and `-f` remain supported. Forced regeneration removes the
+adapter's prior generated outputs to avoid stale CSV/NPZ combinations. Historical
+input files cannot overlap generated output paths.
+
+## Historical CSV input
+
+The same script also accepts downloaded Bitget historical CSV files. Input mode
+is detected automatically, or selected with `--input-format raw|csv`.
+
+```sh
+python scripts/merge_bitget_books.py \
+  --input mm_strategy/data_buy/zecusdt --date 20260916 \
+  --output mm_strategy/model_v1/merged_books/ZECUSDT/20260916 \
+  --symbol ZECUSDT --tick-size 0.01 --build-npz
+```
+
+The directory must contain one file for each of these types for the selected day:
+
+- `bitget-futures_incremental_book_L2_ZECUSDT_20260916.csv.zst`
+- `bitget-futures_book_ticker_ZECUSDT_20260916.csv.zst`
+- `bitget-futures_trades_ZECUSDT_20260916.csv.zst`
+
+Plain `.csv` and `.csv.gz` are supported too. If there are several dates, select
+one with `--date YYYYMMDD` or `YYYY-MM-DD`. Process days sequentially into separate
+output directories; the current adapter retains frames in memory for independent
+exchange-time and receive-time sorting. No network access or downloads occur.
+
+For custom filenames, provide all three explicit paths instead of `--input`:
+
+```sh
+python scripts/merge_bitget_books.py --input-format csv \
+  --depth-file /data/incremental_book_L2.csv.zst \
+  --book-ticker-file /data/book_ticker.csv.zst \
+  --trades-file /data/trades.csv.zst \
+  --output /data/merged --symbol ZECUSDT --tick-size 0.01 --build-npz
+```
+
+Historical mode fuses **L2 + native-feed book_ticker (books1)**; it does not require
+an independent `books5`. `book_snapshot_5` is a derived L2 snapshot dataset and is
+not treated as the native 10ms `books5` feed. Raw capture mode continues to use
+all three actual channels, including `books5`.
+
+CSV timestamps are Unix microseconds. CSV omits original venue `seq/pseq` and
+connection identity, so historical mode does not claim to verify their continuity.
+It uses source CSV order only as an internal tiebreaker, not a venue sequence.
+Adjacent L2 rows sharing exchange/receive timestamps and snapshot flag are grouped
+as a frame; original message boundaries cannot be recovered exactly from CSV.
+L2 must start with a full snapshot. Later snapshots reset the visible book and
+are counted in `historical_full_snapshots`; they do not prove gap-free coverage.
+Wrong symbols, malformed quotes and conflicting duplicate trades are errors.
+
+Outputs have the same names and independent EXCH/LOCAL semantics as raw mode.
+`summary.json` records `input_format`, the three historical paths and the missing
+sequence/connection validation. Neither mode applies own-liquidity correction.
+
+## Raw capture input
 
 One healthy connection, one symbol, and a full `books` snapshot followed by its
 continuous incrementals. `books1` and `books5` messages must be snapshots. Input

@@ -1,0 +1,21 @@
+[package]
+name = "bitget-merge-native"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+csv = "1.4"
+itoa = "1"
+ryu = "1"
+flate2 = "1"
+serde_json = "1"
+zstd = "0.13"
+zip = { version = "6", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
